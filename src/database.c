@@ -1,20 +1,11 @@
 /*
-Copyright (c) 2009-2021 Roger Light <roger@atchoo.org>
+ * database.c — debug build: eviction tracing
+ * Add -DEVICT_DEBUG to CFLAGS, or keep the #define below.
+ * Remove this file (revert to original) once root cause is found.
+ */
 
-All rights reserved. This program and the accompanying materials
-are made available under the terms of the Eclipse Public License 2.0
-and Eclipse Distribution License v1.0 which accompany this distribution.
-
-The Eclipse Public License is available at
-   https://www.eclipse.org/legal/epl-2.0/
-and the Eclipse Distribution License is available at
-  http://www.eclipse.org/org/documents/edl-v10.php.
-
-SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
-
-Contributors:
-   Roger Light - initial implementation and documentation.
-*/
+/* Uncomment to enable without changing CFLAGS */
+/* #define EVICT_DEBUG */
 
 #include "config.h"
 
@@ -27,13 +18,17 @@ Contributors:
 #include "sys_tree.h"
 #include "util_mosq.h"
 
+/* ------------------------------------------------------------------ */
+/* Debug macro — logs at DEBUG level only when EVICT_DEBUG is defined  */
+/* ------------------------------------------------------------------ */
+#ifdef EVICT_DEBUG
+#  define EVLOG(fmt, ...) \
+     mosquitto_log_printf(MOSQ_LOG_DEBUG, "EVICT: " fmt, ##__VA_ARGS__)
+#else
+#  define EVLOG(fmt, ...) ((void)0)
+#endif
 
-/**
- * Is this context ready to take more in flight messages right now?
- * @param context the client context of interest
- * @param qos qos for the packet of interest
- * @return true if more in flight are allowed.
- */
+
 bool db__ready_for_flight(struct mosquitto *context, enum mosquitto_msg_direction dir, int qos)
 {
 	struct mosquitto_msg_data *msgs;
@@ -51,11 +46,6 @@ bool db__ready_for_flight(struct mosquitto *context, enum mosquitto_msg_directio
 	}
 
 	if(qos == 0){
-		/* Deliver QoS 0 messages unless the queue is already full.
-		 * For QoS 0 messages the choice is either "inflight" or dropped.
-		 * There is no queueing option, unless the client is offline and
-		 * queue_qos0_messages is enabled.
-		 */
 		if(db.config->max_queued_messages == 0 && db.config->max_inflight_bytes == 0){
 			return true;
 		}
@@ -88,14 +78,6 @@ bool db__ready_for_flight(struct mosquitto *context, enum mosquitto_msg_directio
 }
 
 
-/**
- * For a given client context, are more messages allowed to be queued?
- * It is assumed that inflight checks and queue_qos0 checks have already
- * been made.
- * @param context client of interest
- * @param qos destination qos for the packet of interest
- * @return true if queuing is allowed, false if should be dropped
- */
 bool db__ready_for_queue(struct mosquitto *context, int qos, struct mosquitto_msg_data *msg_data)
 {
 	int source_count;
@@ -110,14 +92,13 @@ bool db__ready_for_queue(struct mosquitto *context, int qos, struct mosquitto_ms
 	}
 
 	if(qos == 0 && db.config->queue_qos0_messages == false){
-		return false; /* This case is handled in db__ready_for_flight() */
+		return false;
 	}else{
 		source_bytes = (ssize_t)msg_data->queued_bytes12;
 		source_count = msg_data->queued_count12;
 	}
 	adjust_count = msg_data->inflight_maximum;
 
-	/* nothing in flight for offline clients */
 	if(!net__is_connected(context)){
 		adjust_bytes = 0;
 		adjust_count = 0;
@@ -145,8 +126,16 @@ void db__msg_add_to_inflight_stats(struct mosquitto_msg_data *msg_data, struct m
 		msg_data->inflight_count12++;
 		msg_data->inflight_bytes12 += client_msg->base_msg->data.payloadlen;
 	}
+	client_msg->base_msg->inflight_ref_count++;
+
+	EVLOG("inflight_ref_count++ store_id=%llu now=%d",
+		(unsigned long long)client_msg->base_msg->data.store_id,
+		client_msg->base_msg->inflight_ref_count);
 }
 
+
+/* Forward declaration */
+static void db__try_evict_payload(struct mosquitto__base_msg *base_msg);
 
 static void db__msg_remove_from_inflight_stats(struct mosquitto_msg_data *msg_data, struct mosquitto__client_msg *client_msg)
 {
@@ -155,6 +144,20 @@ static void db__msg_remove_from_inflight_stats(struct mosquitto_msg_data *msg_da
 	if(client_msg->data.qos != 0){
 		msg_data->inflight_count12--;
 		msg_data->inflight_bytes12 -= client_msg->base_msg->data.payloadlen;
+	}
+	if(client_msg->base_msg->inflight_ref_count > 0){
+		client_msg->base_msg->inflight_ref_count--;
+	}
+
+	EVLOG("inflight_ref_count-- store_id=%llu now=%d",
+		(unsigned long long)client_msg->base_msg->data.store_id,
+		client_msg->base_msg->inflight_ref_count);
+
+	/* Bug B fix: re-attempt eviction when last inflight subscriber ACKs */
+	if(client_msg->base_msg->inflight_ref_count == 0){
+		EVLOG("Bug-B path: last inflight gone, trying evict store_id=%llu",
+			(unsigned long long)client_msg->base_msg->data.store_id);
+		db__try_evict_payload(client_msg->base_msg);
 	}
 }
 
@@ -181,6 +184,53 @@ static void db__msg_remove_from_queued_stats(struct mosquitto_msg_data *msg_data
 }
 
 
+/*
+ * db__try_evict_payload
+ *
+ * Frees the payload from RAM when:
+ *   1. payload is not already NULL
+ *   2. no subscriber currently has this message inflight
+ *   3. the message has been durably written to SQLite (stored==true)
+ *
+ * Sets payload_on_disk=true so the broker reloads from SQLite before sending.
+ */
+static void db__try_evict_payload(struct mosquitto__base_msg *base_msg)
+{
+	/* Guard 0: null / already evicted */
+	if(base_msg == NULL || base_msg->data.payload == NULL){
+		EVLOG("store_id=%llu SKIP payload=NULL (already evicted or null msg)",
+			base_msg ? (unsigned long long)base_msg->data.store_id : 0ULL);
+		return;
+	}
+
+	/* Guard 1: still inflight to at least one subscriber */
+	if(base_msg->inflight_ref_count > 0){
+		EVLOG("store_id=%llu SKIP inflight_ref_count=%d (payload needed for delivery)",
+			(unsigned long long)base_msg->data.store_id,
+			base_msg->inflight_ref_count);
+		return;
+	}
+
+	/* Guard 2: not yet written to SQLite — unsafe to evict */
+	if(base_msg->stored == false){
+		EVLOG("store_id=%llu SKIP stored=false (SQLite write not confirmed yet)",
+			(unsigned long long)base_msg->data.store_id);
+		return;
+	}
+
+	/* All guards passed — evict */
+	EVLOG("store_id=%llu EVICTING payloadlen=%u inflight_ref=%d stored=%d",
+		(unsigned long long)base_msg->data.store_id,
+		base_msg->data.payloadlen,
+		base_msg->inflight_ref_count,
+		(int)base_msg->stored);
+
+	mosquitto_FREE(base_msg->data.payload);
+	base_msg->data.payload = NULL;
+	base_msg->payload_on_disk = true;
+}
+
+
 int db__open(struct mosquitto__config *config)
 {
 	if(!config){
@@ -195,9 +245,7 @@ int db__open(struct mosquitto__config *config)
 	db.bridge_count = 0;
 #endif
 
-	/* Initialize the hashtable */
 	db.clientid_index_hash = NULL;
-
 	db.normal_subs = NULL;
 	db.shared_subs = NULL;
 
@@ -229,7 +277,6 @@ static void subhier_clean(struct mosquitto__subhier **subhier)
 			leaf = nextleaf;
 		}
 		subhier_clean(&peer->children);
-
 		HASH_DELETE(hh, *subhier, peer);
 		mosquitto_FREE(peer);
 	}
@@ -242,7 +289,6 @@ int db__close(void)
 	subhier_clean(&db.shared_subs);
 	retain__clean(&db.retains);
 	db__msg_store_clean();
-
 	return MOSQ_ERR_SUCCESS;
 }
 
@@ -392,6 +438,19 @@ static void db__fill_inflight_out_from_queue(struct mosquitto *context)
 			db__message_remove_queued(context, &context->msgs_out, client_msg);
 			continue;
 		}
+		/* Reload payload from SQLite if it was evicted from RAM while queued */
+		if(client_msg->base_msg->payload_on_disk){
+			EVLOG("reload from disk store_id=%llu client=%s",
+				(unsigned long long)client_msg->base_msg->data.store_id,
+				context->id ? context->id : "(null)");
+			if(plugin_persist__handle_base_msg_load(client_msg->base_msg) != MOSQ_ERR_SUCCESS){
+				mosquitto_log_printf(MOSQ_LOG_ERR,
+					"EVICT: Failed to reload evicted payload store_id=%llu, dropping.",
+					(unsigned long long)client_msg->base_msg->data.store_id);
+				db__message_remove_queued(context, &context->msgs_out, client_msg);
+				continue;
+			}
+		}
 		plugin_persist__handle_client_msg_update(context, client_msg);
 		db__message_dequeue_first(context, &context->msgs_out);
 	}
@@ -428,11 +487,11 @@ int db__message_delete_outgoing(struct mosquitto *context, uint16_t mid, enum mo
 	DL_FOREACH_SAFE(context->msgs_out.inflight, client_msg, tmp){
 		if(client_msg->data.mid == mid){
 			if(client_msg->data.qos != qos){
-				log__printf(NULL, MOSQ_LOG_INFO, "Protocol error from %s: Mismatched QoS (%d:%d) when deleting outgoing message.",
+				mosquitto_log_printf(MOSQ_LOG_INFO, "Protocol error from %s: Mismatched QoS (%d:%d) when deleting outgoing message.",
 						context->id, client_msg->data.qos, qos);
 				return MOSQ_ERR_PROTOCOL;
 			}else if(qos == 2 && client_msg->data.state != expect_state && expect_state != mosq_ms_any){
-				log__printf(NULL, MOSQ_LOG_INFO, "Protocol error from %s: Mismatched state (%d:%d) when deleting outgoing message.",
+				mosquitto_log_printf(MOSQ_LOG_INFO, "Protocol error from %s: Mismatched state (%d:%d) when deleting outgoing message.",
 						context->id, client_msg->data.state, expect_state);
 				return MOSQ_ERR_PROTOCOL;
 			}
@@ -464,7 +523,6 @@ int db__message_delete_outgoing(struct mosquitto *context, uint16_t mid, enum mo
 }
 
 
-/* Only for QoS 2 messages */
 int db__message_insert_incoming(struct mosquitto *context, uint64_t cmsg_id, struct mosquitto__base_msg *base_msg, bool persist)
 {
 	struct mosquitto__client_msg *client_msg;
@@ -477,9 +535,7 @@ int db__message_insert_incoming(struct mosquitto *context, uint64_t cmsg_id, str
 		return MOSQ_ERR_INVAL;
 	}
 	if(!context->id){
-		/* Protect against unlikely "client is disconnected but not entirely freed" scenario */
 		return MOSQ_ERR_SUCCESS;
-
 	}
 	msg_data = &context->msgs_in;
 
@@ -489,16 +545,14 @@ int db__message_insert_incoming(struct mosquitto *context, uint64_t cmsg_id, str
 		state = mosq_ms_queued;
 		rc = 2;
 	}else{
-		/* Dropping message due to full queue. */
 		if(context->is_dropping == false){
 			context->is_dropping = true;
-			log__printf(NULL, MOSQ_LOG_NOTICE,
+			mosquitto_log_printf(MOSQ_LOG_NOTICE,
 					"Outgoing messages are being dropped for client %s.",
 					context->id);
 		}
 		metrics__int_inc(mosq_counter_mqtt_publish_dropped, 1);
 		context->stats.messages_dropped++;
-
 		return 2;
 	}
 
@@ -548,6 +602,24 @@ int db__message_insert_incoming(struct mosquitto *context, uint64_t cmsg_id, str
 		plugin_persist__handle_client_msg_add(context, client_msg);
 	}
 
+	if(state == mosq_ms_queued){
+		EVLOG("INSERT_INCOMING queued store_id=%llu client=%s persist=%d is_persisted=%d stored_before=%d",
+			(unsigned long long)base_msg->data.store_id,
+			context->id ? context->id : "(null)",
+			(int)persist,
+			(int)context->is_persisted,
+			(int)base_msg->stored);
+
+		/* Bug A fix: persist unconditionally for queued messages */
+		plugin_persist__handle_base_msg_add(client_msg->base_msg);
+
+		EVLOG("INSERT_INCOMING after handle_base_msg_add stored=%d payload=%s",
+			(int)base_msg->stored,
+			base_msg->data.payload ? "present" : "NULL");
+
+		db__try_evict_payload(client_msg->base_msg);
+	}
+
 	if(client_msg->base_msg->data.qos > 0){
 		util__decrement_receive_quota(context);
 	}
@@ -555,7 +627,8 @@ int db__message_insert_incoming(struct mosquitto *context, uint64_t cmsg_id, str
 }
 
 
-int db__message_insert_outgoing(struct mosquitto *context, uint64_t cmsg_id, uint16_t mid, uint8_t qos, bool retain, struct mosquitto__base_msg *base_msg, uint32_t subscription_identifier, bool update, bool persist)
+int db__message_insert_outgoing(struct mosquitto *context, uint64_t cmsg_id, uint16_t mid, uint8_t qos, bool retain,
+		struct mosquitto__base_msg *base_msg, uint32_t subscription_identifier, bool update, bool persist)
 {
 	struct mosquitto__client_msg *client_msg;
 	struct mosquitto_msg_data *msg_data;
@@ -568,34 +641,24 @@ int db__message_insert_outgoing(struct mosquitto *context, uint64_t cmsg_id, uin
 		return MOSQ_ERR_INVAL;
 	}
 	if(!context->id){
-		/* Protect against unlikely "client is disconnected but not entirely freed" scenario */
 		return MOSQ_ERR_SUCCESS;
-
 	}
 	context->stats.messages_sent++;
 
 	msg_data = &context->msgs_out;
 
-	/* Check whether we've already sent this message to this client
-	 * for outgoing messages only.
-	 * If retain==true then this is a stale retained message and so should be
-	 * sent regardless. FIXME - this does mean retained messages will received
-	 * multiple times for overlapping subscriptions, although this is only the
-	 * case for SUBSCRIPTION with multiple subs in so is a minor concern.
-	 */
 	if(context->protocol != mosq_p_mqtt5
 			&& db.config->allow_duplicate_messages == false
 			&& retain == false && base_msg->dest_ids){
 
 		for(int i=0; i<base_msg->dest_id_count; i++){
 			if(base_msg->dest_ids[i] && !strcmp(base_msg->dest_ids[i], context->id)){
-				/* We have already sent this message to this client. */
 				return MOSQ_ERR_SUCCESS;
 			}
 		}
 	}
+
 	if(!net__is_connected(context)){
-		/* Client is not connected only queue messages with QoS>0. */
 		if(qos == 0 && !db.config->queue_qos0_messages){
 			if(!context->bridge){
 				return 2;
@@ -613,24 +676,17 @@ int db__message_insert_outgoing(struct mosquitto *context, uint64_t cmsg_id, uin
 	if(net__is_connected(context)){
 		if(db__ready_for_flight(context, mosq_md_out, qos)){
 			switch(qos){
-				case 0:
-					state = mosq_ms_publish_qos0;
-					break;
-				case 1:
-					state = mosq_ms_publish_qos1;
-					break;
-				case 2:
-					state = mosq_ms_publish_qos2;
-					break;
+				case 0: state = mosq_ms_publish_qos0; break;
+				case 1: state = mosq_ms_publish_qos1; break;
+				case 2: state = mosq_ms_publish_qos2; break;
 			}
 		}else if(qos != 0 && db__ready_for_queue(context, qos, msg_data)){
 			state = mosq_ms_queued;
 			rc = 2;
 		}else{
-			/* Dropping message due to full queue. */
 			if(context->is_dropping == false){
 				context->is_dropping = true;
-				log__printf(NULL, MOSQ_LOG_NOTICE,
+				mosquitto_log_printf(MOSQ_LOG_NOTICE,
 						"Outgoing messages are being dropped for client %s.",
 						context->id);
 			}
@@ -644,7 +700,7 @@ int db__message_insert_outgoing(struct mosquitto *context, uint64_t cmsg_id, uin
 			metrics__int_inc(mosq_counter_mqtt_publish_dropped, 1);
 			if(context->is_dropping == false){
 				context->is_dropping = true;
-				log__printf(NULL, MOSQ_LOG_NOTICE,
+				mosquitto_log_printf(MOSQ_LOG_NOTICE,
 						"Outgoing messages are being dropped for client %s.",
 						context->id);
 			}
@@ -697,14 +753,30 @@ int db__message_insert_outgoing(struct mosquitto *context, uint64_t cmsg_id, uin
 		plugin_persist__handle_client_msg_add(context, client_msg);
 	}
 
+	if(state == mosq_ms_queued){
+		EVLOG("INSERT_OUTGOING queued store_id=%llu client=%s persist=%d is_persisted=%d connected=%d stored_before=%d",
+			(unsigned long long)base_msg->data.store_id,
+			context->id ? context->id : "(null)",
+			(int)persist,
+			(int)context->is_persisted,
+			(int)net__is_connected(context),
+			(int)base_msg->stored);
+
+		/* Bug A fix: persist unconditionally for queued messages */
+		plugin_persist__handle_base_msg_add(client_msg->base_msg);
+
+		EVLOG("INSERT_OUTGOING after handle_base_msg_add stored=%d payload=%s",
+			(int)base_msg->stored,
+			base_msg->data.payload ? "present" : "NULL");
+
+		db__try_evict_payload(client_msg->base_msg);
+
+		EVLOG("INSERT_OUTGOING after try_evict payload=%s payload_on_disk=%d",
+			base_msg->data.payload ? "present" : "NULL",
+			(int)base_msg->payload_on_disk);
+	}
+
 	if(db.config->allow_duplicate_messages == false && retain == false){
-		/* Record which client ids this message has been sent to so we can avoid duplicates.
-		 * Outgoing messages only.
-		 * If retain==true then this is a stale retained message and so should be
-		 * sent regardless. FIXME - this does mean retained messages will received
-		 * multiple times for overlapping subscriptions, although this is only the
-		 * case for SUBSCRIPTION with multiple subs in so is a minor concern.
-		 */
 		dest_ids = mosquitto_realloc(base_msg->dest_ids, sizeof(char *)*(size_t)(base_msg->dest_id_count+1));
 		if(dest_ids){
 			base_msg->dest_ids = dest_ids;
@@ -717,6 +789,7 @@ int db__message_insert_outgoing(struct mosquitto *context, uint64_t cmsg_id, uin
 			return MOSQ_ERR_NOMEM;
 		}
 	}
+
 #ifdef WITH_BRIDGE
 	if(context->bridge && context->bridge->start_type == bst_lazy
 			&& !net__is_connected(context)
@@ -753,7 +826,7 @@ static inline int db__message_update_outgoing_state(struct mosquitto *context, s
 	DL_FOREACH(head, client_msg){
 		if(client_msg->data.mid == mid){
 			if(client_msg->data.qos != qos){
-				log__printf(NULL, MOSQ_LOG_INFO, "Protocol error from %s: Mismatched QoS (%d:%d) when updating outgoing message.",
+				mosquitto_log_printf(MOSQ_LOG_INFO, "Protocol error from %s: Mismatched QoS (%d:%d) when updating outgoing message.",
 						context->id, client_msg->data.qos, qos);
 				return MOSQ_ERR_PROTOCOL;
 			}
@@ -855,7 +928,8 @@ int db__messages_delete(struct mosquitto *context, bool force_free)
 }
 
 
-int db__messages_easy_queue(struct mosquitto *context, const char *topic, uint8_t qos, uint32_t payloadlen, const void *payload, int retain, uint32_t message_expiry_interval, mosquitto_property **properties)
+int db__messages_easy_queue(struct mosquitto *context, const char *topic, uint8_t qos, uint32_t payloadlen,
+		const void *payload, int retain, uint32_t message_expiry_interval, mosquitto_property **properties)
 {
 	struct mosquitto__base_msg *base_msg;
 	const char *source_id;
@@ -890,7 +964,6 @@ int db__messages_easy_queue(struct mosquitto *context, const char *topic, uint8_
 			db__msg_store_free(base_msg);
 			return MOSQ_ERR_NOMEM;
 		}
-		/* Ensure payload is always zero terminated, this is the reason for the extra byte above */
 		((uint8_t *)base_msg->data.payload)[base_msg->data.payloadlen] = 0;
 		memcpy(base_msg->data.payload, payload, base_msg->data.payloadlen);
 	}
@@ -920,27 +993,6 @@ int db__messages_easy_queue(struct mosquitto *context, const char *topic, uint8_
 
 #define MOSQ_UUID_EPOCH 1637168273
 
-
-/* db__new_msg_id() attempts to generate a new unique id on the broker, or a
- * number of brokers. It uses the 10-bit node ID, which can be set by plugins
- * to allow different brokers to share the same plugin persistence database
- * without overlapping one another.
- *
- * The message ID is a 64-bit unsigned integer arranged as follows:
- *
- * 10-bit ID  31-bit seconds                 23-bit fractional seconds
- * iiiiiiiiiisssssssssssssssssssssssssssssssnnnnnnnnnnnnnnnnnnnnnnn
- *
- * 10-bit ID gives a total of 1024 brokers can produce unique values (complete overkill)
- * 31-bit seconds gives a roll over date of 68 years after MOSQ_UUID_EPOCH - 2089.
- *    This roll over date would affect messages that have been queued waiting
- *    for a client to receive them, or retained messages only. If either of
- *    those remains for 68 years unchanged, then there will potentially be a
- *    collision. Ideally we need to ensure, however, that the message id is
- *    continually increasing for sorting purposes.
- * 23-bit fractional seconds gives a resolution of 120ns, or 8.4 million
- *    messages per second per broker.
- */
 uint64_t db__new_msg_id(void)
 {
 #ifdef WIN32
@@ -954,23 +1006,23 @@ uint64_t db__new_msg_id(void)
 	time_t sec;
 	long nsec;
 
-	id = db.node_id_shifted; /* Top 10-bits */
+	id = db.node_id_shifted;
 
 #ifdef WIN32
 	GetSystemTimePreciseAsFileTime(&ftime);
 	ftime64 = (((uint64_t)ftime.dwHighDateTime)<<32) + ftime.dwLowDateTime;
-	tmp = ftime64 - 116444736000000000LL; /* Convert offset to unix epoch, still in counts of 100ns */
-	sec = tmp / 10000000; /* Convert to seconds */
-	nsec = (long)(tmp - sec)*100; /* Remove seconds, convert to counts of 1ns */
+	tmp = ftime64 - 116444736000000000LL;
+	sec = tmp / 10000000;
+	nsec = (long)(tmp - sec)*100;
 #else
 	clock_gettime(CLOCK_REALTIME, &ts);
 	sec = ts.tv_sec;
 	nsec = ts.tv_nsec;
 #endif
 	tmp = (sec - MOSQ_UUID_EPOCH) & 0x7FFFFFFF;
-	id = id | (tmp << 23); /* Seconds, 31-bits (68 years) */
+	id = id | (tmp << 23);
 
-	tmp = (nsec & 0x7FFFFF80); /* top 23-bits of the bottom 30 bits (1 billion ns), ~100 ns resolution */
+	tmp = (nsec & 0x7FFFFF80);
 	id = id | (tmp >> 7);
 
 	if(id <= db.last_db_id){
@@ -982,8 +1034,8 @@ uint64_t db__new_msg_id(void)
 }
 
 
-/* This function requires topic to be allocated on the heap. Once called, it owns topic and will free it on error. Likewise payload and properties. */
-int db__message_store(const struct mosquitto *source, struct mosquitto__base_msg *base_msg, uint32_t *message_expiry_interval, enum mosquitto_msg_origin origin)
+int db__message_store(const struct mosquitto *source, struct mosquitto__base_msg *base_msg,
+		uint32_t *message_expiry_interval, enum mosquitto_msg_origin origin)
 {
 	int rc;
 
@@ -995,7 +1047,7 @@ int db__message_store(const struct mosquitto *source, struct mosquitto__base_msg
 		base_msg->data.source_id = mosquitto_strdup("");
 	}
 	if(!base_msg->data.source_id){
-		log__printf(NULL, MOSQ_LOG_ERR, "Error: Out of memory.");
+		mosquitto_log_printf(MOSQ_LOG_ERR, "Error: Out of memory.");
 		db__msg_store_free(base_msg);
 		return MOSQ_ERR_NOMEM;
 	}
@@ -1066,8 +1118,6 @@ int db__message_store_find(struct mosquitto *context, uint16_t mid, struct mosqu
 }
 
 
-/* Called on reconnect to set outgoing messages to a sensible state and force a
- * retry, and to set incoming messages to expect an appropriate retry. */
 static int db__message_reconnect_reset_outgoing(struct mosquitto *context)
 {
 	struct mosquitto__client_msg *client_msg, *tmp;
@@ -1089,12 +1139,8 @@ static int db__message_reconnect_reset_outgoing(struct mosquitto *context)
 		}
 
 		switch(client_msg->data.qos){
-			case 0:
-				client_msg->data.state = mosq_ms_publish_qos0;
-				break;
-			case 1:
-				client_msg->data.state = mosq_ms_publish_qos1;
-				break;
+			case 0: client_msg->data.state = mosq_ms_publish_qos0; break;
+			case 1: client_msg->data.state = mosq_ms_publish_qos1; break;
 			case 2:
 				if(client_msg->data.state == mosq_ms_wait_for_pubcomp){
 					client_msg->data.state = mosq_ms_resend_pubrel;
@@ -1105,12 +1151,6 @@ static int db__message_reconnect_reset_outgoing(struct mosquitto *context)
 		}
 		plugin_persist__handle_client_msg_update(context, client_msg);
 	}
-	/* Messages received when the client was disconnected are put
-	 * in the mosq_ms_queued state. If we don't change them to the
-	 * appropriate "publish" state, then the queued messages won't
-	 * get sent until the client next receives a message - and they
-	 * will be sent out of order.
-	 */
 	DL_FOREACH_SAFE(context->msgs_out.queued, client_msg, tmp){
 		db__msg_add_to_queued_stats(&context->msgs_out, client_msg);
 	}
@@ -1120,7 +1160,6 @@ static int db__message_reconnect_reset_outgoing(struct mosquitto *context)
 }
 
 
-/* Called on reconnect to set incoming messages to expect an appropriate retry. */
 static int db__message_reconnect_reset_incoming(struct mosquitto *context)
 {
 	struct mosquitto__client_msg *client_msg, *tmp;
@@ -1142,36 +1181,20 @@ static int db__message_reconnect_reset_incoming(struct mosquitto *context)
 		}
 
 		if(client_msg->data.qos != 2){
-			/* Anything <QoS 2 can be completely retried by the client at
-			 * no harm. */
 			db__message_remove_inflight(context, &context->msgs_in, client_msg);
 		}else{
-			/* Message state can be preserved here because it should match
-			 * whatever the client has got. */
 			client_msg->data.dup = 0;
 		}
 	}
 
-	/* Messages received when the client was disconnected are put
-	 * in the mosq_ms_queued state. If we don't change them to the
-	 * appropriate "publish" state, then the queued messages won't
-	 * get sent until the client next receives a message - and they
-	 * will be sent out of order.
-	 */
 	DL_FOREACH_SAFE(context->msgs_in.queued, client_msg, tmp){
 		client_msg->data.dup = 0;
 		db__msg_add_to_queued_stats(&context->msgs_in, client_msg);
 		if(db__ready_for_flight(context, mosq_md_in, client_msg->data.qos)){
 			switch(client_msg->data.qos){
-				case 0:
-					client_msg->data.state = mosq_ms_publish_qos0;
-					break;
-				case 1:
-					client_msg->data.state = mosq_ms_publish_qos1;
-					break;
-				case 2:
-					client_msg->data.state = mosq_ms_publish_qos2;
-					break;
+				case 0: client_msg->data.state = mosq_ms_publish_qos0; break;
+				case 1: client_msg->data.state = mosq_ms_publish_qos1; break;
+				case 2: client_msg->data.state = mosq_ms_publish_qos2; break;
 			}
 			db__message_dequeue_first(context, &context->msgs_in);
 			plugin_persist__handle_client_msg_update(context, client_msg);
@@ -1205,7 +1228,7 @@ int db__message_remove_incoming(struct mosquitto *context, uint16_t mid)
 	DL_FOREACH_SAFE(context->msgs_in.inflight, client_msg, tmp){
 		if(client_msg->data.mid == mid){
 			if(client_msg->base_msg->data.qos != 2){
-				log__printf(NULL, MOSQ_LOG_INFO, "Protocol error from %s: Incorrect QoS (%d) when deleting incoming message.",
+				mosquitto_log_printf(MOSQ_LOG_INFO, "Protocol error from %s: Incorrect QoS (%d) when deleting incoming message.",
 						context->id, client_msg->base_msg->data.qos);
 				return MOSQ_ERR_PROTOCOL;
 			}
@@ -1234,7 +1257,7 @@ int db__message_release_incoming(struct mosquitto *context, uint16_t mid)
 	DL_FOREACH_SAFE(context->msgs_in.inflight, client_msg, tmp){
 		if(client_msg->data.mid == mid){
 			if(client_msg->base_msg->data.qos != 2){
-				log__printf(NULL, MOSQ_LOG_INFO, "Protocol error from %s: Incorrect QoS (%d) when releasing incoming message.",
+				mosquitto_log_printf(MOSQ_LOG_INFO, "Protocol error from %s: Incorrect QoS (%d) when releasing incoming message.",
 						context->id, client_msg->base_msg->data.qos);
 				return MOSQ_ERR_PROTOCOL;
 			}
@@ -1242,10 +1265,6 @@ int db__message_release_incoming(struct mosquitto *context, uint16_t mid)
 			retain = client_msg->data.retain;
 			source_id = client_msg->base_msg->data.source_id;
 
-			/* topic==NULL should be a QoS 2 message that was
-			 * denied/dropped and is being processed so the client doesn't
-			 * keep resending it. That means we don't send it to other
-			 * clients. */
 			if(topic == NULL){
 				db__message_remove_inflight(context, &context->msgs_in, client_msg);
 				deleted = true;
@@ -1315,7 +1334,8 @@ void db__expire_all_messages(struct mosquitto *context)
 }
 
 
-static void db__client_messages_check_acl(struct mosquitto *context, struct mosquitto_msg_data *msg_data, struct mosquitto__client_msg **head,
+static void db__client_messages_check_acl(struct mosquitto *context, struct mosquitto_msg_data *msg_data,
+		struct mosquitto__client_msg **head,
 		void (*decrement_stats_fn)(struct mosquitto_msg_data *msg_data, struct mosquitto__client_msg *client_msg))
 {
 	struct mosquitto__client_msg *client_msg, *tmp;
@@ -1373,7 +1393,6 @@ static int db__message_write_inflight_out_single(struct mosquitto *context, stru
 	expiry_interval = 0;
 	if(base_msg->data.expiry_time){
 		if(db.now_real_s > base_msg->data.expiry_time){
-			/* Message is expired, must not send. */
 			if(client_msg->data.direction == mosq_md_out && client_msg->data.qos > 0){
 				util__increment_send_quota(context);
 			}
@@ -1407,7 +1426,7 @@ static int db__message_write_inflight_out_single(struct mosquitto *context, stru
 		case mosq_ms_publish_qos1:
 			rc = send__publish(context, mid, topic, payloadlen, payload, qos, retain, retries, subscription_id, base_msg_props, expiry_interval);
 			if(rc == MOSQ_ERR_SUCCESS){
-				client_msg->data.dup = 1; /* Any retry attempts are a duplicate. */
+				client_msg->data.dup = 1;
 				client_msg->data.state = mosq_ms_wait_for_puback;
 				plugin_persist__handle_client_msg_update(context, client_msg);
 			}else if(rc == MOSQ_ERR_OVERSIZE_PACKET){
@@ -1420,7 +1439,7 @@ static int db__message_write_inflight_out_single(struct mosquitto *context, stru
 		case mosq_ms_publish_qos2:
 			rc = send__publish(context, mid, topic, payloadlen, payload, qos, retain, retries, subscription_id, base_msg_props, expiry_interval);
 			if(rc == MOSQ_ERR_SUCCESS){
-				client_msg->data.dup = 1; /* Any retry attempts are a duplicate. */
+				client_msg->data.dup = 1;
 				client_msg->data.state = mosq_ms_wait_for_pubrec;
 				plugin_persist__handle_client_msg_update(context, client_msg);
 			}else if(rc == MOSQ_ERR_OVERSIZE_PACKET){
@@ -1486,12 +1505,9 @@ int db__message_write_inflight_out_latest(struct mosquitto *context)
 	}
 
 	if(context->msgs_out.inflight->prev == context->msgs_out.inflight){
-		/* Only one message */
 		return db__message_write_inflight_out_single(context, context->msgs_out.inflight);
 	}
 
-	/* Start at the end of the list and work backwards looking for the first
-	 * message in a non-publish state */
 	client_msg = context->msgs_out.inflight->prev;
 	while(client_msg != context->msgs_out.inflight &&
 			(client_msg->data.state == mosq_ms_publish_qos0
@@ -1501,9 +1517,6 @@ int db__message_write_inflight_out_latest(struct mosquitto *context)
 		client_msg = client_msg->prev;
 	}
 
-	/* Tail is now either the head of the list, if that message is waiting for
-	 * publish, or the oldest message not waiting for a publish. In the latter
-	 * case, any pending publishes should be next after this message. */
 	if(client_msg != context->msgs_out.inflight){
 		client_msg = client_msg->next;
 	}

@@ -113,8 +113,6 @@ static int create_tables(struct mosquitto_sqlite *ms)
 			"("
 			"topic STRING PRIMARY KEY,"
 			"store_id INT64"
-			//"FOREIGN KEY (store_id) REFERENCES msg_store(store_id) "
-			//"ON DELETE CASCADE"
 			");",
 			NULL, NULL, NULL);
 	if(rc){
@@ -168,11 +166,6 @@ static int create_tables(struct mosquitto_sqlite *ms)
 			"retain INTEGER,"
 			"state INTEGER,"
 			"subscription_identifier INTEGER"
-			//"state INTEGER,"
-			//"FOREIGN KEY (client_id) REFERENCES clients(client_id) "
-			//"ON DELETE CASCADE,"
-			//"FOREIGN KEY (store_id) REFERENCES msg_store(store_id) "
-			//"ON DELETE CASCADE"
 			");",
 			NULL, NULL, NULL);
 	if(rc){
@@ -181,6 +174,15 @@ static int create_tables(struct mosquitto_sqlite *ms)
 
 	rc = sqlite3_exec(ms->db,
 			"CREATE INDEX IF NOT EXISTS client_msgs_client_id ON client_msgs(client_id);",
+			NULL, NULL, NULL);
+	if(rc){
+		goto fail;
+	}
+
+	/* Composite index for queued message dispatch on reconnect */
+	rc = sqlite3_exec(ms->db,
+			"CREATE INDEX IF NOT EXISTS client_msgs_client_state "
+			"ON client_msgs(client_id, state);",
 			NULL, NULL, NULL);
 	if(rc){
 		goto fail;
@@ -255,18 +257,21 @@ static int create_tables(struct mosquitto_sqlite *ms)
 			db_schema_version[1] = 1;
 			db_schema_version[2] = 0;
 		}
-		/* 1.1.x  is the current DB-Schema version */
+		/* 1.1.x is the current DB-Schema version */
 		if(db_schema_version[1] == 1){
 			return 0;
 		}
 	}
-	mosquitto_log_printf(MOSQ_LOG_ERR, "Sqlite persistence: Unknown database_schema version %d.%d.%d",
+	mosquitto_log_printf(MOSQ_LOG_ERR,
+			"Sqlite persistence: Unknown database_schema version %d.%d.%d",
 			db_schema_version[0], db_schema_version[1], db_schema_version[2]);
 	rc = MOSQ_ERR_INVAL;
 	goto close_db;
 
 fail:
-	mosquitto_log_printf(MOSQ_LOG_ERR, "Sqlite persistence: Error creating tables: %s %s", sqlite3_errstr(rc), ms->db ? sqlite3_errmsg(ms->db) : "");
+	mosquitto_log_printf(MOSQ_LOG_ERR,
+			"Sqlite persistence: Error creating tables: %s %s",
+			sqlite3_errstr(rc), ms->db ? sqlite3_errmsg(ms->db) : "");
 close_db:
 	sqlite3_close(ms->db);
 	ms->db = NULL;
@@ -285,26 +290,19 @@ static int prepare_statements(struct mosquitto_sqlite *ms)
 			"VALUES (?,?,?,?)",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->subscription_add_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM subscriptions WHERE client_id=? and topic=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->subscription_remove_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM subscriptions WHERE client_id=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->subscription_clear_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
-
+	if(rc){ goto fail; }
 
 	/* Clients */
 	rc = sqlite3_prepare_v3(ms->db,
@@ -315,26 +313,20 @@ static int prepare_statements(struct mosquitto_sqlite *ms)
 			"VALUES(?,?,?,?,?,?,?,?,?,?,?)",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->client_add_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM clients WHERE client_id=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->client_remove_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"UPDATE clients SET session_expiry_time=?, will_delay_time=? "
 			"WHERE client_id=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->client_update_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	/* Client messages */
 	rc = sqlite3_prepare_v3(ms->db,
@@ -343,42 +335,31 @@ static int prepare_statements(struct mosquitto_sqlite *ms)
 			"VALUES(?,?,?,?,?,?,?,?,?,?)",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->client_msg_add_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM client_msgs WHERE client_id=? AND store_id=? AND direction=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->client_msg_remove_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
-
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"UPDATE client_msgs SET state=?,dup=? WHERE client_id=? AND store_id=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->client_msg_update_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM client_msgs WHERE client_id=? AND direction=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->client_msg_clear_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM client_msgs WHERE client_id=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->client_msg_clear_all_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	/* Message store */
 	rc = sqlite3_prepare_v3(ms->db,
@@ -388,17 +369,13 @@ static int prepare_statements(struct mosquitto_sqlite *ms)
 			"VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->base_msg_add_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM base_msgs WHERE store_id=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->base_msg_remove_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM base_msgs AS bm "
@@ -409,9 +386,7 @@ static int prepare_statements(struct mosquitto_sqlite *ms)
 			"  WHERE cm.client_id = ? AND oc.store_id IS NULL AND rm.store_id IS NULL)",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->base_msg_remove_for_clientid_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"SELECT store_id, expiry_time, topic, payload, source_id, source_username, "
@@ -419,9 +394,7 @@ static int prepare_statements(struct mosquitto_sqlite *ms)
 			"FROM base_msgs WHERE store_id=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->base_msg_load_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	/* Retains */
 	rc = sqlite3_prepare_v3(ms->db,
@@ -430,17 +403,13 @@ static int prepare_statements(struct mosquitto_sqlite *ms)
 			"VALUES(?,?)",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->retain_msg_set_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM retains WHERE topic=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->retain_msg_remove_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	/* Will messages */
 	rc = sqlite3_prepare_v3(ms->db,
@@ -449,21 +418,19 @@ static int prepare_statements(struct mosquitto_sqlite *ms)
 			"VALUES(?,?,?,?,?,?,?)",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->will_add_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	rc = sqlite3_prepare_v3(ms->db,
 			"DELETE FROM wills WHERE client_id=?",
 			-1, SQLITE_PREPARE_PERSISTENT,
 			&ms->will_remove_stmt, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
 
 	return 0;
 fail:
-	mosquitto_log_printf(MOSQ_LOG_ERR, "Sqlite persistence: Error preparing statements: %s", sqlite3_errstr(rc));
+	mosquitto_log_printf(MOSQ_LOG_ERR,
+			"Sqlite persistence: Error preparing statements: %s",
+			sqlite3_errstr(rc));
 	sqlite3_close(ms->db);
 	ms->db = NULL;
 	return 1;
@@ -475,45 +442,70 @@ int persist_sqlite__init(struct mosquitto_sqlite *ms)
 	int rc;
 	char buf[50];
 
-	rc = sqlite3_open_v2(ms->db_file, &ms->db, SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE, NULL);
+	rc = sqlite3_open_v2(ms->db_file, &ms->db,
+			SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
 	if(rc != SQLITE_OK){
-		mosquitto_log_printf(MOSQ_LOG_ERR, "Sqlite persistence: Error opening %s: %s",
+		mosquitto_log_printf(MOSQ_LOG_ERR,
+				"Sqlite persistence: Error opening %s: %s",
 				ms->db_file, sqlite3_errstr(rc));
 		return MOSQ_ERR_UNKNOWN;
 	}
+
 	snprintf(buf, sizeof(buf), "PRAGMA page_size=%u;", ms->page_size);
 	rc = sqlite3_exec(ms->db, buf, NULL, NULL, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
+
 	rc = sqlite3_exec(ms->db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
+
 	rc = sqlite3_exec(ms->db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
-	if(rc){
-		goto fail;
-	}
+	if(rc){ goto fail; }
+
 	snprintf(buf, sizeof(buf), "PRAGMA synchronous=%d;", ms->synchronous);
 	rc = sqlite3_exec(ms->db, buf, NULL, NULL, NULL);
-	if(rc){
-		goto fail;
+	if(rc){ goto fail; }
+
+	if(ms->cache_size_kb > 0){
+		snprintf(buf, sizeof(buf), "PRAGMA cache_size=-%u;", ms->cache_size_kb);
+		rc = sqlite3_exec(ms->db, buf, NULL, NULL, NULL);
+		if(rc){ goto fail; }
 	}
+
+	/*
+	 * wal_autocheckpoint: SQLite automatically runs a PASSIVE checkpoint
+	 * whenever the WAL file reaches this many pages.
+	 *
+	 * This is a safety net that keeps WAL bounded between our periodic
+	 * RESTART checkpoints in tick_cb. Without this, a burst of writes
+	 * between ticks could grow the WAL unboundedly.
+	 *
+	 * 16384 pages × 4KB page = 64MB WAL trigger.
+	 * Set to 0 to disable and rely solely on tick_cb checkpoints.
+	 */
+	rc = sqlite3_exec(ms->db,
+			"PRAGMA wal_autocheckpoint=16384;",
+			NULL, NULL, NULL);
+	if(rc){ goto fail; }
+
+	mosquitto_log_printf(MOSQ_LOG_INFO,
+			"Sqlite persistence: db=%s sync=%d flush=%us "
+			"page=%u cache=%dKB autocheckpoint=64MB",
+			ms->db_file, ms->synchronous, ms->flush_period,
+			ms->page_size, ms->cache_size_kb);
 
 	rc = create_tables(ms);
-	if(rc){
-		return rc;
-	}
+	if(rc){ return rc; }
 
 	rc = prepare_statements(ms);
-	if(rc){
-		return rc;
-	}
+	if(rc){ return rc; }
 
 	sqlite3_exec(ms->db, "BEGIN;", NULL, NULL, NULL);
 	return MOSQ_ERR_SUCCESS;
+
 fail:
-	mosquitto_log_printf(MOSQ_LOG_ERR, "Sqlite persistence: Error opening database: %s", sqlite3_errstr(rc));
+	mosquitto_log_printf(MOSQ_LOG_ERR,
+			"Sqlite persistence: Error opening database: %s",
+			sqlite3_errstr(rc));
 	return MOSQ_ERR_UNKNOWN;
 }
 
@@ -522,8 +514,10 @@ void persist_sqlite__cleanup(struct mosquitto_sqlite *ms)
 {
 	if(ms->db){
 		int rc = sqlite3_exec(ms->db, "END;", NULL, NULL, NULL);
-		if(rc !=  SQLITE_OK){
-			mosquitto_log_printf(MOSQ_LOG_ERR, "Error: Sqlite persistence: Closing final transaction %s", sqlite3_errstr(rc));
+		if(rc != SQLITE_OK){
+			mosquitto_log_printf(MOSQ_LOG_ERR,
+					"Error: Sqlite persistence: Closing final transaction %s",
+					sqlite3_errstr(rc));
 		}
 	}
 
@@ -548,16 +542,25 @@ void persist_sqlite__cleanup(struct mosquitto_sqlite *ms)
 	sqlite3_finalize(ms->will_remove_stmt);
 
 	if(ms->db){
-		int rc = sqlite3_wal_checkpoint_v2(ms->db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL);
-		if(rc !=  SQLITE_OK){
-			mosquitto_log_printf(MOSQ_LOG_WARNING, "Warning: Sqlite persistence: Final  wal_checkpoint  %s", sqlite3_errstr(rc));
+		/*
+		 * Final checkpoint on shutdown — try TRUNCATE to leave a clean
+		 * zero-length WAL. May not fully succeed if readers are still
+		 * active, which is acceptable at shutdown.
+		 */
+		int rc = sqlite3_wal_checkpoint_v2(ms->db, NULL,
+				SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL);
+		if(rc != SQLITE_OK){
+			mosquitto_log_printf(MOSQ_LOG_WARNING,
+					"Warning: Sqlite persistence: Final wal_checkpoint: %s",
+					sqlite3_errstr(rc));
 		}
 		rc = sqlite3_close(ms->db);
-		if(rc !=  SQLITE_OK){
-			mosquitto_log_printf(MOSQ_LOG_WARNING, "Warning: Sqlite persistence: Error closing database: %s", sqlite3_errstr(rc));
+		if(rc != SQLITE_OK){
+			mosquitto_log_printf(MOSQ_LOG_WARNING,
+					"Warning: Sqlite persistence: Error closing database: %s",
+					sqlite3_errstr(rc));
 		}
 		ms->db = NULL;
 	}
 	mosquitto_log_printf(MOSQ_LOG_INFO, "Sqlite persistence: Closed DB");
-
 }

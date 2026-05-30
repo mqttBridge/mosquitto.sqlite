@@ -351,6 +351,36 @@ void plugin_persist__handle_base_msg_delete(struct mosquitto__base_msg *base_msg
 }
 
 
+/* Ask the persistence plugin to reload the payload for a base_msg whose
+ * payload was evicted from RAM.  On success the plugin allocates
+ * base_msg->data.payload via mosquitto_malloc() and this function clears
+ * the payload_on_disk flag.  Returns MOSQ_ERR_SUCCESS on success. */
+int plugin_persist__handle_base_msg_load(struct mosquitto__base_msg *base_msg)
+{
+	struct mosquitto_evt_persist_base_msg event_data;
+	struct mosquitto__callback *cb_base, *cb_next;
+	struct mosquitto__security_options *opts;
+
+	if(base_msg->payload_on_disk == false || db.shutdown){
+		return MOSQ_ERR_SUCCESS;
+	}
+
+	opts = &db.config->security_options;
+	memset(&event_data, 0, sizeof(event_data));
+	event_data.data.store_id = base_msg->data.store_id;
+
+	DL_FOREACH_SAFE(opts->plugin_callbacks.persist_base_msg_load, cb_base, cb_next){
+		int rc = cb_base->cb(MOSQ_EVT_PERSIST_BASE_MSG_LOAD, &event_data, cb_base->userdata);
+		if(rc == MOSQ_ERR_SUCCESS && event_data.data.payload != NULL){
+			base_msg->data.payload = event_data.data.payload;
+			base_msg->payload_on_disk = false;
+			return MOSQ_ERR_SUCCESS;
+		}
+	}
+	return MOSQ_ERR_UNKNOWN;
+}
+
+
 void plugin_persist__handle_retain_msg_set(struct mosquitto__base_msg *base_msg)
 {
 	struct mosquitto_evt_persist_retain_msg event_data;
@@ -437,7 +467,7 @@ void plugin_persist__handle_will_delete(struct mosquitto *context)
 
 	opts = &db.config->security_options;
 	DL_FOREACH_SAFE(opts->plugin_callbacks.persist_will_delete, cb_base, cb_next){
-		cb_base->cb(MOSQ_EVT_PERSIST_WILL_ADD, &event_data, cb_base->userdata);
+		cb_base->cb(MOSQ_EVT_PERSIST_WILL_DELETE, &event_data, cb_base->userdata);
 	}
 
 }

@@ -190,6 +190,7 @@ struct plugin__callbacks {
 	struct mosquitto__callback *persist_client_msg_update;
 	struct mosquitto__callback *persist_base_msg_add;
 	struct mosquitto__callback *persist_base_msg_delete;
+	struct mosquitto__callback *persist_base_msg_load;
 	struct mosquitto__callback *persist_retain_msg_set;
 	struct mosquitto__callback *persist_retain_msg_delete;
 	struct mosquitto__callback *persist_will_add;
@@ -430,8 +431,10 @@ struct mosquitto__base_msg {
 	char **dest_ids;
 	int dest_id_count;
 	int ref_count;
+	int inflight_ref_count; /* # of client_msgs currently inflight for this base_msg */
 	enum mosquitto_msg_origin origin;
 	bool stored;
+	bool payload_on_disk; /* payload freed from RAM; lives only in SQLite */
 };
 
 struct mosquitto__client_msg {
@@ -867,6 +870,7 @@ void plugin_persist__handle_client_msg_delete(struct mosquitto *context, const s
 void plugin_persist__handle_client_msg_update(struct mosquitto *context, const struct mosquitto__client_msg *cmsg);
 void plugin_persist__handle_base_msg_add(struct mosquitto__base_msg *base_msg);
 void plugin_persist__handle_base_msg_delete(struct mosquitto__base_msg *base_msg);
+int  plugin_persist__handle_base_msg_load(struct mosquitto__base_msg *base_msg);
 void plugin_persist__handle_retain_msg_set(struct mosquitto__base_msg *base_msg);
 void plugin_persist__handle_retain_msg_delete(struct mosquitto__base_msg *base_msg);
 void plugin_persist__handle_will_add(struct mosquitto *context);

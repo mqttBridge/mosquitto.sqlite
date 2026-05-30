@@ -94,6 +94,51 @@ int persist_sqlite__base_msg_remove_cb(int event, void *event_data, void *userda
 }
 
 
+/* Reload the payload for a single base_msg that was evicted from RAM.
+ * The broker passes store_id in event_data->data.store_id.
+ * This callback allocates event_data->data.payload via mosquitto_malloc()
+ * and sets event_data->data.payloadlen.  The broker takes ownership of the
+ * allocated buffer. */
+int persist_sqlite__base_msg_load_cb(int event, void *event_data, void *userdata)
+{
+	struct mosquitto_evt_persist_base_msg *ed = event_data;
+	struct mosquitto_sqlite *ms = userdata;
+	const void *payload;
+	uint32_t payloadlen;
+	int rc;
+
+	UNUSED(event);
+
+	if(sqlite3_bind_int64(ms->base_msg_load_stmt, 1, (int64_t)ed->data.store_id) != SQLITE_OK){
+		sqlite3_reset(ms->base_msg_load_stmt);
+		return MOSQ_ERR_UNKNOWN;
+	}
+
+	rc = sqlite3_step(ms->base_msg_load_stmt);
+	if(rc != SQLITE_ROW){
+		sqlite3_reset(ms->base_msg_load_stmt);
+		return MOSQ_ERR_NOT_FOUND;
+	}
+
+	payload = sqlite3_column_blob(ms->base_msg_load_stmt, 3);
+	payloadlen = (uint32_t)sqlite3_column_int(ms->base_msg_load_stmt, 6);
+
+	if(payload && payloadlen > 0){
+		ed->data.payload = mosquitto_malloc(payloadlen + 1);
+		if(!ed->data.payload){
+			sqlite3_reset(ms->base_msg_load_stmt);
+			return MOSQ_ERR_NOMEM;
+		}
+		memcpy(ed->data.payload, payload, payloadlen);
+		((uint8_t *)ed->data.payload)[payloadlen] = 0;
+		ed->data.payloadlen = payloadlen;
+	}
+
+	sqlite3_reset(ms->base_msg_load_stmt);
+	return MOSQ_ERR_SUCCESS;
+}
+
+
 int persist_sqlite__base_msg_clear(struct mosquitto_sqlite *ms, const char *clientid)
 {
 	int rc = MOSQ_ERR_UNKNOWN;

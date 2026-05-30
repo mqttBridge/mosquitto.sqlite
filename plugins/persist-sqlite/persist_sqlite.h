@@ -29,6 +29,7 @@ Contributors:
 
 struct mosquitto_sqlite {
 	char *db_file;
+	char *conf_file;        /* ← ADD: path to sqlite.conf */
 	sqlite3 *db;
 	sqlite3_stmt *client_add_stmt;
 	sqlite3_stmt *client_remove_stmt;
@@ -53,6 +54,9 @@ struct mosquitto_sqlite {
 	unsigned int event_count;
 	unsigned int flush_period;
 	unsigned int page_size;
+	int cache_size_kb;        /* ← new */
+        unsigned int tick_count;
+        unsigned int vacuum_period;  /* ticks between VACUUMs, 0=disabled */	
 };
 
 int persist_sqlite__init(struct mosquitto_sqlite *ms);
