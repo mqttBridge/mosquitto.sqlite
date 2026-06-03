@@ -17,6 +17,16 @@ Contributors:
    Tatsuzo Osawa - Add epoll.
 */
 
+/* -------------------------------------------------------------------
+ * Modifications:
+ * - Added persistence-related events for SQLite plugin
+ * - Extended MOSQ_EVT_* enums
+ * - Modified structures for persistence integration
+ *
+ * Source:
+ * https://github.com/mqttBridge/mosquitto.sqlite
+ * ------------------------------------------------------------------- */
+
 #ifndef MOSQUITTO_BROKER_INTERNAL_H
 #define MOSQUITTO_BROKER_INTERNAL_H
 
