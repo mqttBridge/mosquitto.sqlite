@@ -16,6 +16,16 @@ Contributors:
    Roger Light - initial implementation and documentation.
 */
 
+/* -------------------------------------------------------------------
+ * Modifications:
+ * - Added persistence-related events for SQLite plugin
+ * - Extended MOSQ_EVT_* enums
+ * - Modified structures for persistence integration
+ *
+ * Source:
+ * https://github.com/mqttBridge/mosquitto.sqlite
+ * ------------------------------------------------------------------- */
+
 #include "config.h"
 
 #include <errno.h>
